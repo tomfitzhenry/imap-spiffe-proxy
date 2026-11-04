@@ -121,7 +121,8 @@ func (p *Proxy) handle(ctx context.Context, raw net.Conn) {
 		p.log.Warn("mTLS handshake produced no peer SPIFFE ID", "remote", remote, "error", err)
 		return
 	}
-	logger := p.log.With("spiffe_id", peerID.String(), "remote", remote)
+	readOnly := p.cfg.IsReadOnly(peerID)
+	logger := p.log.With("spiffe_id", peerID.String(), "remote", remote, "read_only", readOnly)
 	logger.Info("accepted mTLS connection")
 
 	upstream, err := p.dialUpstream(ctx)
@@ -133,7 +134,7 @@ func (p *Proxy) handle(ctx context.Context, raw net.Conn) {
 	}
 	defer upstream.Close()
 
-	sess := newSession(p.cfg, tlsConn, upstream, logger)
+	sess := newSession(p.cfg, tlsConn, upstream, readOnly, logger)
 	sess.run()
 }
 

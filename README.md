@@ -24,12 +24,18 @@ much smaller test suite.
 
 - No public certificate: the proxy's TLS identity is its SPIFFE X509-SVID from
   the local SPIRE agent Workload API, and clients are authenticated by mTLS.
-- The exact SPIFFE-ID allowlist is enforced inside the TLS handshake
-  (`tlsconfig.AuthorizeOneOf`): a valid SVID that is not on the allowlist cannot
-  even complete the handshake.
+- The exact SPIFFE-ID allowlist (`-rw` plus `-ro`) is enforced inside the TLS
+  handshake (`tlsconfig.AuthorizeOneOf`): a valid SVID that is on neither list
+  cannot even complete the handshake.
 - All allowlisted identities share one upstream IMAP account. On the first
   `LOGIN` a client must name the configured account; its password is discarded
   and the configured password is injected.
+- Clients are allowlisted per mode. `-rw <spiffe-id>` may issue any command;
+  `-ro <spiffe-id>` may issue only commands that do not change mailbox state,
+  and anything else is rejected locally with a tagged `NO` and a closed
+  connection. For read-only identities `SELECT` is rewritten to `EXAMINE`, so
+  the upstream also opens the mailbox read-only and a plain `FETCH BODY[...]`
+  cannot set `\Seen`. The two lists must be disjoint.
 - The IMAP password is never a flag or config field. It is read once at startup
   from the systemd credential `imap-password`
   (`$CREDENTIALS_DIRECTORY/imap-password`) and never logged.
@@ -39,14 +45,18 @@ much smaller test suite.
 - `AUTHENTICATE`, `STARTTLS`, a second `LOGIN`, a mismatched username, and
   unparseable commands are rejected locally and close the connection. Nothing
   unparsed is ever forwarded.
-- Byte-exact pass-through for every other command and for all responses,
-  including IMAP literals.
+- Byte-exact pass-through for every other forwarded command and for all
+  responses, including IMAP literals.
 
 ## Status and known limitations
 
 - **One shared account.** Every allowlisted SVID gets the same mailbox. There is
   no per-user isolation, per-client quota, or separate audit trail beyond the
   proxy log. Removing an identity from the allowlist is a restart.
+- **Read-only is a proxy command policy, not a server-side ACL.** It is
+  enforced by the proxy (the upstream only sees `EXAMINE` instead of `SELECT`),
+  not configured on the upstream server, and all identities still share one
+  upstream account. Changing either identity list is a restart.
 - **The password is a bearer secret.** It is a systemd credential, so root and
   the service can read it. There is no secret-manager integration and no
   rotation without replacing the credential and restarting the service.
@@ -71,7 +81,12 @@ The proxy is a single process. For every accepted TCP connection it:
    certificate chain and hostname against the system trust store.
 3. Reads one client command line at a time. `LOGIN` is parsed and rewritten with
    the configured username and password; `AUTHENTICATE`, `STARTTLS` and a second
-   `LOGIN` are refused; everything else is forwarded byte-for-byte.
+   `LOGIN` are refused. For an identity marked read-only, only commands that do
+   not change mailbox state are forwarded; everything else, including unknown
+   commands, is rejected locally with a tagged `NO` and the connection is
+   closed. A read-only identity's `SELECT` is rewritten to `EXAMINE` so the
+   upstream enforces read-only selection too. Other commands are forwarded
+   byte-for-byte.
 4. Relays literal payloads in both directions. For a synchronizing client
    literal the proxy sends its own continuation, waits for the upstream's
    continuation (which it swallows), then streams the payload and forwards the
@@ -100,8 +115,12 @@ from the systemd credential.
 | `-upstream` | required | upstream IMAP server `host:port`; always implicit TLS |
 | `-upstream-server-name` | host of `-upstream` | TLS SNI/verification name |
 | `-username` | required | the one shared upstream IMAP username |
-| `-allow` | required (repeatable) | exact client SPIFFE ID to allow |
+| `-rw` | none (repeatable) | exact client SPIFFE ID allowed to issue any command |
+| `-ro` | none (repeatable) | exact client SPIFFE ID restricted to non-mutating commands |
 | `-version` | | print the version and exit |
+
+At least one `-rw` or `-ro` is required, and an identity may appear in only one
+of the two lists.
 
 The proxy and the test client find the SPIRE agent through the standard
 `SPIFFE_ENDPOINT_SOCKET` environment variable:
@@ -127,7 +146,8 @@ ExecStart=/nix/store/.../bin/imap-spiffe-proxy \
   -listen :1430 \
   -upstream imap.gmail.com:993 \
   -username user@gmail.com \
-  -allow spiffe://example.org/client/alice
+  -rw spiffe://example.org/client/alice \
+  -ro spiffe://example.org/client/bob
 ```
 
 `LoadCredential=` gives the service a private read-only copy at
@@ -152,8 +172,10 @@ services.imap-spiffe-proxy = {
   upstreamAddress = "imap.gmail.com:993";
   username = "user@gmail.com";
   passwordFile = "/run/secrets/imap-password";
-  allowedIdentities = [
+  readWriteIdentities = [
     "spiffe://example.org/client/alice"
+  ];
+  readOnlyIdentities = [
     "spiffe://example.org/client/bob"
   ];
 };
@@ -164,6 +186,8 @@ gives it the `spire-agent` group so it can read the Workload API socket, sets
 `SPIFFE_ENDPOINT_SOCKET`, and passes the password as a `LoadCredential` (it is
 never on the command line). `spireEndpointSocket`, `spireGroup`, `user`, `group`,
 `createUser`, `upstreamTLSServerName` and `extraArgs` are overridable.
+`readWriteIdentities` and `readOnlyIdentities` must be disjoint, and at least
+one of them must be non-empty.
 
 ## SPIRE registration
 
@@ -187,8 +211,9 @@ spire-server entry create \
 
 Registration and authorization are separate: `entry create` only decides which
 workloads can obtain which SVID. Whether an SVID can use the proxy is decided
-solely by `-allow` / `allowedIdentities`, inside the TLS handshake. The IDs must
-match exactly.
+solely by the `-rw` / `-ro` allowlists (the module's `readWriteIdentities` /
+`readOnlyIdentities`), inside the TLS handshake. The IDs must match exactly, and
+each ID must be in exactly one of the two lists.
 
 ## Gmail
 
@@ -222,9 +247,11 @@ export SPIFFE_ENDPOINT_SOCKET=unix:///run/spire/agent/public/api.sock
 ```
 
 Modes: `login` (LOGIN with a deliberately wrong password, SELECT, APPEND with a
-synchronizing literal, SEARCH, FETCH and verify the body, LOGOUT), `idle`,
-`wrong-username`, `auth`, `malformed`, and `deny` (must be rejected in the TLS
-handshake). Every mode exits 0 only when the expected outcome is observed.
+synchronizing literal, SEARCH, FETCH and verify the body, LOGOUT), `read-only`
+(LOGIN and reads through the proxy, then `STORE`, which must be rejected),
+`idle`, `wrong-username`, `auth`, `malformed`, and `deny` (must be rejected in
+the TLS handshake). Every mode exits 0 only when the expected outcome is
+observed.
 
 ## Integration test
 
@@ -242,7 +269,9 @@ NixOS module. It asserts that:
   proxy stays healthy;
 - a mismatched username, `AUTHENTICATE`, and malformed commands are rejected;
 - `IDLE`/`DONE` and a synchronizing-literal `APPEND` plus a literal `FETCH`
-  round-trip.
+  round-trip;
+- carol, who is allowlisted read-only, can log in and read, but her `STORE` is
+  rejected locally, the proxy stays healthy, and alice can still log in.
 
 Everything is local to the VM; it needs KVM but no host SPIRE, Gmail account, or
 network.
@@ -253,6 +282,12 @@ network.
   a bearer credential: any allowlisted client can use the shared mailbox, and a
   malicious client with an allowlisted SVID is indistinguishable from a
   legitimate one until its SVID expires or its SPIRE entry is removed.
+- For a read-only identity, a command outside the non-mutating set is refused
+  locally with a tagged `NO` and the connection is closed; nothing is forwarded
+  upstream, so a rejected `APPEND`'s literal payload never reaches the server.
+  Unknown commands are rejected too (fail closed). `SELECT` is rewritten to
+  `EXAMINE` so the upstream itself refuses mutations in a read-only session and
+  reading a message does not set `\Seen`.
 - The proxy log contains peer SPIFFE IDs and remote addresses, but never
   passwords, client-supplied password bytes, or SVID private keys.
 - A private upstream CA must be installed in the host's system trust store;

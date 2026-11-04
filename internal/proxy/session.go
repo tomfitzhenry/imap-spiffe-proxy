@@ -8,6 +8,7 @@ import (
 	"io"
 	"log/slog"
 	"net"
+	"strings"
 	"sync"
 	"time"
 )
@@ -67,6 +68,13 @@ func (c *continuation) begin() (chan error, bool) {
 	return c.ch, true
 }
 
+// pending reports whether a continuation is currently armed.
+func (c *continuation) pending() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.ch != nil
+}
+
 // deliver consumes a pending continuation. It reports whether one was pending.
 func (c *continuation) deliver(err error) bool {
 	c.mu.Lock()
@@ -108,6 +116,10 @@ type session struct {
 	upstream net.Conn
 	log      *slog.Logger
 
+	// readOnly reports whether the peer identity may issue only commands that
+	// do not change mailbox state.
+	readOnly bool
+
 	clientW *lockedWriter
 	cont    continuation
 
@@ -115,12 +127,13 @@ type session struct {
 	idle      bool
 }
 
-func newSession(cfg Config, client, upstream net.Conn, logger *slog.Logger) *session {
+func newSession(cfg Config, client, upstream net.Conn, readOnly bool, logger *slog.Logger) *session {
 	return &session{
 		cfg:      cfg,
 		client:   client,
 		upstream: upstream,
 		log:      logger,
+		readOnly: readOnly,
 		clientW:  &lockedWriter{w: client},
 	}
 }
@@ -231,6 +244,21 @@ func (s *session) clientLoop() error {
 					return err
 				}
 			}
+			// Read-only identities may issue only commands that do not change
+			// mailbox state; everything else is rejected locally, before
+			// anything (including any literal payload) reaches the upstream.
+			if s.readOnly {
+				if !readOnlyAllowed(cmd) {
+					s.log.Warn("policy: rejected command for a read-only identity", "tag", cmd.Tag, "command", cmd.Name)
+					s.sendTagged(cmd.Tag, "NO", "Command not permitted for a read-only identity")
+					return nil
+				}
+				// Open the mailbox read-only: the upstream then also refuses
+				// mutations, and a plain FETCH BODY[...] cannot set \Seen.
+				if cmd.Name == "SELECT" {
+					forward = selectAsExamine(cmd)
+				}
+			}
 		}
 
 		if err := s.forward(forward, hdr, hasLiteral, r); err != nil {
@@ -258,6 +286,84 @@ func (s *session) clientLoop() error {
 }
 
 var errCloseSession = errors.New("close session after responding")
+
+// readOnlyCommands is the positive allowlist of commands a read-only identity
+// may issue: commands that do not change mailbox state. It is a positive
+// allowlist so that a command introduced by a future IMAP extension is
+// rejected rather than accidentally forwarded (fail closed).
+//
+// Everything not listed here is a violation for a read-only identity,
+// including APPEND, STORE, COPY, MOVE, EXPUNGE, CLOSE (which expunges),
+// CREATE, DELETE, RENAME, SUBSCRIBE, UNSUBSCRIBE, CHECK, SETACL, DELETEACL,
+// SETQUOTA and SETMETADATA. UID is a command group, so the subcommand decides.
+var readOnlyCommands = map[string]struct{}{
+	// Session and capability commands. LOGIN is permitted: it is parsed,
+	// rewritten with the shared account and injected password above, and
+	// authenticating does not change mailbox state.
+	"LOGIN":      {},
+	"CAPABILITY": {},
+	"ID":         {},
+	"NOOP":       {},
+	"LOGOUT":     {},
+	"IDLE":       {},
+	"ENABLE":     {},
+	// Mailbox selection and metadata.
+	"SELECT":    {},
+	"EXAMINE":   {},
+	"UNSELECT":  {},
+	"STATUS":    {},
+	"LIST":      {},
+	"LSUB":      {},
+	"XLIST":     {},
+	"NAMESPACE": {},
+	// Message access.
+	"SEARCH":     {},
+	"FETCH":      {},
+	"SORT":       {},
+	"THREAD":     {},
+	"UID SEARCH": {},
+	"UID FETCH":  {},
+	"UID SORT":   {},
+	"UID THREAD": {},
+	// Quota and ACL reads.
+	"GETQUOTA":     {},
+	"GETQUOTAROOT": {},
+	"GETMETADATA":  {},
+	"MYRIGHTS":     {},
+	"LISTRIGHTS":   {},
+}
+
+// readOnlyAllowed reports whether cmd is permitted for a read-only identity.
+func readOnlyAllowed(cmd *command) bool {
+	name := cmd.Name
+	if name == "UID" {
+		name = "UID " + firstArgumentUpper(cmd.Args)
+	}
+	_, ok := readOnlyCommands[name]
+	return ok
+}
+
+// firstArgumentUpper returns the first space-delimited argument of args in
+// upper case, or "" when there is none.
+func firstArgumentUpper(args string) string {
+	fields := strings.Fields(args)
+	if len(fields) == 0 {
+		return ""
+	}
+	return strings.ToUpper(fields[0])
+}
+
+// selectAsExamine rewrites a SELECT command's line to EXAMINE. The tag, the
+// arguments and any trailing literal marker are preserved; the literal payload
+// and the rest of the command line are relayed by forward like any other
+// command.
+func selectAsExamine(cmd *command) []byte {
+	line := cmd.Tag + " EXAMINE"
+	if cmd.Args != "" {
+		line += " " + cmd.Args
+	}
+	return []byte(line + "\r\n")
+}
 
 // rewriteLogin enforces the LOGIN policy and returns the command line to send
 // upstream: the configured username and password replace the client's
@@ -354,11 +460,17 @@ func (s *session) pump() error {
 			}
 			continue
 		}
+		// Snapshot whether a literal continuation is armed before forwarding:
+		// an upstream line that arrives while one is armed is that literal's
+		// rejection, but a line read before a later command armed its own
+		// continuation must not be mistaken for one. The request loop can arm
+		// the next literal concurrently, so checking after the write would race.
+		pending := s.cont.pending()
 		// Forward the upstream response before waking a forwarder that is
 		// waiting for a literal continuation, so the client sees the rejection
 		// before the session closes.
 		writeErr := s.clientW.write(line)
-		if s.cont.deliver(errUpstreamRejected) {
+		if pending && s.cont.deliver(errUpstreamRejected) {
 			// The upstream rejected the literal instead of accepting it.
 			return errUpstreamRejected
 		}

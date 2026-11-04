@@ -1,7 +1,8 @@
 // Command imap-spiffe-client is a minimal raw IMAP client for imap-spiffe-proxy.
 // It gets its X509-SVID from the SPIFFE Workload API and verifies the proxy's
 // SPIFFE ID in the TLS handshake. Login proves password injection (it sends a
-// wrong password), a synchronizing-literal APPEND and a FETCH round trip.
+// wrong password), a synchronizing-literal APPEND and a FETCH round trip; the
+// read-only mode proves an identity may read but not mutate.
 package main
 
 import (
@@ -35,7 +36,7 @@ func main() {
 	addr := flag.String("addr", "", "imap-spiffe-proxy address (host:port)")
 	serverID := flag.String("server-id", "", "expected proxy SPIFFE ID (required)")
 	username := flag.String("username", "", "IMAP username sent on LOGIN (required)")
-	mode := flag.String("mode", "login", "mode: login, idle, wrong-username, auth, malformed or deny")
+	mode := flag.String("mode", "login", "mode: login, idle, wrong-username, auth, malformed, deny or read-only")
 	message := flag.String("message", "hello from imap-spiffe-client", "APPEND body text")
 	flag.Parse()
 	if *addr == "" || *serverID == "" || *username == "" {
@@ -65,7 +66,7 @@ func run(mode, addr, username, message string, tlsCfg *tls.Config) error {
 		return runDeny(addr, tlsCfg)
 	}
 	switch mode {
-	case "login", "idle", "wrong-username", "auth", "malformed":
+	case "login", "idle", "wrong-username", "auth", "malformed", "read-only":
 	default:
 		return fmt.Errorf("unknown mode %q", mode)
 	}
@@ -79,6 +80,8 @@ func run(mode, addr, username, message string, tlsCfg *tls.Config) error {
 		return c.loginFlow(username, message)
 	case "idle":
 		return c.idleFlow(username)
+	case "read-only":
+		return c.readOnlyFlow(username)
 	case "wrong-username":
 		return c.cmdRejected("LOGIN %s %s", strconv.Quote("not-"+username), wrongPass)
 	case "auth":
@@ -290,6 +293,38 @@ func (c *client) idleFlow(username string) error {
 		return fmt.Errorf("IDLE/DONE: %w", err)
 	}
 	return c.logout()
+}
+
+// readOnlyFlow proves a read-only identity may issue read commands but not
+// mutating ones. The proxy answers the mutating command with a tagged NO and
+// then closes the connection, so this mode deliberately never sends LOGOUT.
+func (c *client) readOnlyFlow(username string) error {
+	if _, err := c.cmd(true, "LOGIN %s %s", strconv.Quote(username), wrongPass); err != nil {
+		return fmt.Errorf("LOGIN: %w", err)
+	}
+	if _, err := c.cmd(true, "SELECT INBOX"); err != nil {
+		return fmt.Errorf("SELECT INBOX: %w", err)
+	}
+	rep, err := c.cmd(true, "SEARCH ALL")
+	if err != nil {
+		return fmt.Errorf("SEARCH ALL: %w", err)
+	}
+	if rep.seq != "" {
+		if _, err := c.cmd(true, "FETCH %s BODY[TEXT]", rep.seq); err != nil {
+			return fmt.Errorf("FETCH BODY[TEXT]: %w", err)
+		}
+	}
+	// A mutating command must be rejected with a tagged NO, never OK; the proxy
+	// then closes the connection, so there is no LOGOUT afterwards.
+	rep, err = c.cmd(false, "STORE 1 +FLAGS (\\Deleted)")
+	if err != nil {
+		return fmt.Errorf("STORE was not rejected: %w", err)
+	}
+	fields := strings.Fields(rep.final)
+	if len(fields) < 2 || strings.HasPrefix(fields[0], "*") || strings.ToUpper(fields[1]) != "NO" {
+		return fmt.Errorf("STORE: expected a tagged NO, got %q", rep.final)
+	}
+	return nil
 }
 
 func (c *client) malformed() error {

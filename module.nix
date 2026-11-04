@@ -29,9 +29,13 @@ let
       (escapeShellArg cfg.upstreamTLSServerName)
     ]
     ++ lib.concatMap (identity: [
-      "-allow"
+      "-rw"
       (escapeShellArg identity)
-    ]) cfg.allowedIdentities
+    ]) cfg.readWriteIdentities
+    ++ lib.concatMap (identity: [
+      "-ro"
+      (escapeShellArg identity)
+    ]) cfg.readOnlyIdentities
     ++ cfg.extraArgs;
 in
 {
@@ -67,10 +71,23 @@ in
       description = "The one shared upstream IMAP username.";
     };
 
-    allowedIdentities = mkOption {
+    readWriteIdentities = mkOption {
       type = types.listOf types.str;
       default = [ ];
-      description = "Exact SPIFFE IDs allowed to connect, enforced in the TLS handshake.";
+      description = "Exact SPIFFE IDs allowed to connect with full (read-write) IMAP command access, enforced in the TLS handshake.";
+    };
+
+    readOnlyIdentities = mkOption {
+      type = types.listOf types.str;
+      default = [ ];
+      description = ''
+        Exact SPIFFE IDs allowed to connect but restricted to IMAP commands
+        that do not change mailbox state (for example FETCH and SEARCH, but not
+        STORE or APPEND). The proxy rejects every other command locally, and
+        rewrites SELECT to EXAMINE so the upstream also enforces read-only
+        selection. An identity must appear in exactly one of
+        `readWriteIdentities` and `readOnlyIdentities`.
+      '';
     };
 
     passwordFile = mkOption {
@@ -118,8 +135,12 @@ in
   config = mkIf cfg.enable {
     assertions = [
       {
-        assertion = cfg.allowedIdentities != [ ];
-        message = "services.imap-spiffe-proxy.allowedIdentities must not be empty.";
+        assertion = cfg.readWriteIdentities != [ ] || cfg.readOnlyIdentities != [ ];
+        message = "services.imap-spiffe-proxy needs at least one entry in readWriteIdentities or readOnlyIdentities.";
+      }
+      {
+        assertion = lib.all (id: !(lib.elem id cfg.readWriteIdentities)) cfg.readOnlyIdentities;
+        message = "services.imap-spiffe-proxy.readWriteIdentities and readOnlyIdentities must be disjoint.";
       }
     ];
 

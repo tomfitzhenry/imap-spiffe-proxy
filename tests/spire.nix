@@ -7,8 +7,9 @@
 # not allowlisted is denied; the upstream leg is implicit TLS verified against
 # the system trust store (the test CA is added to it); every allowlisted
 # identity maps to one shared IMAP account whose password comes only from a
-# systemd LoadCredential; and AUTHENTICATE, malformed commands and a mismatched
-# LOGIN username are rejected without disturbing the service.
+# systemd LoadCredential; AUTHENTICATE, malformed commands and a mismatched
+# LOGIN username are rejected without disturbing the service; and a read-only
+# identity can read but cannot mutate, again without disturbing the service.
 { pkgs, lib, package }:
 
 let
@@ -20,6 +21,7 @@ let
   aliceUid = 4500;
   bobUid = 4501;
   malloryUid = 4502;
+  carolUid = 4503;
   sharedUid = 4600;
 
   proxyListen = "127.0.0.1:1430";
@@ -37,6 +39,7 @@ let
   aliceID = "spiffe://${trustDomain}/client/alice";
   bobID = "spiffe://${trustDomain}/client/bob";
   malloryID = "spiffe://${trustDomain}/client/mallory";
+  carolID = "spiffe://${trustDomain}/client/carol";
 
   # The proxy only ever reads $CREDENTIALS_DIRECTORY/imap-password; tmpfiles
   # installs this test-only credential at /run with mode 0400.
@@ -119,6 +122,7 @@ let
     create_workload "unix:uid:${toString aliceUid}" "${aliceID}"
     create_workload "unix:uid:${toString bobUid}" "${bobID}"
     create_workload "unix:uid:${toString malloryUid}" "${malloryID}"
+    create_workload "unix:uid:${toString carolUid}" "${carolID}"
   '';
 in
 pkgs.testers.nixosTest {
@@ -155,6 +159,11 @@ pkgs.testers.nixosTest {
           uid = malloryUid;
           group = "mallory";
         };
+        carol = {
+          isNormalUser = true;
+          uid = carolUid;
+          group = "carol";
+        };
         # The one shared upstream IMAP account every allowlisted identity maps
         # to; it is the only account Dovecot ever authenticates.
         shared-imap = {
@@ -168,6 +177,7 @@ pkgs.testers.nixosTest {
         alice.gid = aliceUid;
         bob.gid = bobUid;
         mallory.gid = malloryUid;
+        carol.gid = carolUid;
         shared-imap.gid = sharedUid;
       };
 
@@ -257,10 +267,12 @@ pkgs.testers.nixosTest {
         upstreamAddress = dovecotTLSListen;
         upstreamTLSServerName = "localhost";
         username = sharedUsername;
-        allowedIdentities = [
+        readWriteIdentities = [
           aliceID
           bobID
         ];
+        # carol may read but must not mutate; the two lists are disjoint.
+        readOnlyIdentities = [ carolID ];
         passwordFile = "/run/imap-spiffe-proxy/imap-password";
       };
 
@@ -351,6 +363,13 @@ pkgs.testers.nixosTest {
 
     with subtest("mallory has a valid SVID but is not allowlisted"):
         machine.succeed(imap_client(${toString malloryUid}, "deny"), timeout=60)
+        machine.succeed("systemctl is-active imap-spiffe-proxy.service")
+        machine.succeed(imap_client(${toString aliceUid}, "login"), timeout=120)
+
+    with subtest("a read-only identity can read but cannot mutate"):
+        # The client exits 0 only if its reads succeeded and the proxy answered
+        # its STORE with a tagged NO and closed the connection.
+        machine.succeed(imap_client(${toString carolUid}, "read-only"), timeout=120)
         machine.succeed("systemctl is-active imap-spiffe-proxy.service")
         machine.succeed(imap_client(${toString aliceUid}, "login"), timeout=120)
   '';

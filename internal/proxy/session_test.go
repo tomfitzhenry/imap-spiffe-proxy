@@ -8,6 +8,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/spiffe/go-spiffe/v2/spiffeid"
 )
 
 // testPeer is one end of a net.Pipe connection driven by a test.
@@ -57,24 +59,47 @@ func (p *testPeer) expectClosed(t *testing.T) {
 }
 
 // startTestSession wires a session to two net.Pipe peers and returns the
-// client-side and upstream-side peers.
+// client-side and upstream-side peers. The peer identity is read-write.
 func startTestSession(t *testing.T) (*testPeer, *testPeer) {
+	t.Helper()
+	return startTestSessionPolicy(t, false)
+}
+
+// startReadOnlyTestSession is startTestSession for a read-only peer identity.
+func startReadOnlyTestSession(t *testing.T) (*testPeer, *testPeer) {
+	t.Helper()
+	return startTestSessionPolicy(t, true)
+}
+
+// startTestSessionPolicy wires a session whose peer identity is alice, either
+// read-write or read-only, mirroring how Proxy.handle derives the policy from
+// the peer's SPIFFE ID.
+func startTestSessionPolicy(t *testing.T, readOnly bool) (*testPeer, *testPeer) {
 	t.Helper()
 	clientConn, proxyClient := net.Pipe()
 	proxyUpstream, upstreamConn := net.Pipe()
 
+	const peerID = "spiffe://example.org/client/alice"
 	cfg := Config{
-		ListenAddress:     "127.0.0.1:1430",
-		UpstreamAddress:   "imap.example.com:993",
-		Username:          "shared",
-		Password:          "real-password",
-		AllowedIdentities: []string{"spiffe://example.org/client/alice"},
+		ListenAddress:       "127.0.0.1:1430",
+		UpstreamAddress:     "imap.example.com:993",
+		Username:            "shared",
+		Password:            "real-password",
+		ReadWriteIdentities: []string{peerID},
+	}
+	if readOnly {
+		cfg.ReadWriteIdentities = nil
+		cfg.ReadOnlyIdentities = []string{peerID}
 	}
 	if err := cfg.Validate(); err != nil {
 		t.Fatalf("Validate: %v", err)
 	}
+	id, err := spiffeid.FromString(peerID)
+	if err != nil {
+		t.Fatalf("parse peer ID: %v", err)
+	}
 
-	sess := newSession(cfg, proxyClient, proxyUpstream, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	sess := newSession(cfg, proxyClient, proxyUpstream, cfg.IsReadOnly(id), slog.New(slog.NewTextHandler(io.Discard, nil)))
 	done := make(chan struct{})
 	go func() {
 		sess.run()
@@ -297,5 +322,181 @@ func TestSessionRejectsLoginWithLiteral(t *testing.T) {
 	_ = upstream.conn.SetReadDeadline(time.Now().Add(time.Second))
 	if _, err := upstream.r.ReadByte(); err == nil {
 		t.Fatal("LOGIN with a literal was forwarded upstream")
+	}
+}
+
+// assertNotForwarded checks that a rejected command never reached the upstream.
+func assertNotForwarded(t *testing.T, upstream *testPeer) {
+	t.Helper()
+	_ = upstream.conn.SetReadDeadline(time.Now().Add(time.Second))
+	if _, err := upstream.r.ReadByte(); err == nil {
+		t.Fatal("rejected command was forwarded upstream")
+	}
+}
+
+func TestSessionReadOnlyAllowsNonMutatingCommands(t *testing.T) {
+	commands := []string{
+		"CAPABILITY",
+		"NOOP",
+		"EXAMINE INBOX",
+		"UNSELECT",
+		"STATUS INBOX (MESSAGES UNSEEN)",
+		`LIST "" *`,
+		`LSUB "" *`,
+		"NAMESPACE",
+		"SEARCH ALL",
+		"FETCH 1 BODY[TEXT]",
+		"SORT (DATE) UTF-8 ALL",
+		"THREAD REFERENCES UTF-8 ALL",
+		"UID FETCH 1:* (FLAGS)",
+		"UID SEARCH ALL",
+		"UID SORT (SUBJECT) UTF-8 ALL",
+		"UID THREAD ORDEREDSUBJECT UTF-8 ALL",
+		`GETQUOTA ""`,
+		"GETQUOTAROOT INBOX",
+		"MYRIGHTS INBOX",
+		"ID NIL",
+		"ENABLE CONDSTORE",
+		"IDLE",
+	}
+	for _, line := range commands {
+		t.Run(line, func(t *testing.T) {
+			client, upstream := startReadOnlyTestSession(t)
+			client.write(t, "A1 "+line+"\r\n")
+			if got, want := upstream.readLine(t), "A1 "+line+"\r\n"; got != want {
+				t.Fatalf("upstream got %q, want %q", got, want)
+			}
+			if line != "IDLE" {
+				upstream.write(t, "A1 OK\r\n")
+				if got, want := client.readLine(t), "A1 OK\r\n"; got != want {
+					t.Fatalf("client got %q, want %q", got, want)
+				}
+			}
+		})
+	}
+}
+
+func TestSessionReadOnlyRejectsMutatingCommands(t *testing.T) {
+	commands := []string{
+		"APPEND INBOX {5}",
+		"STORE 1 +FLAGS (\\Deleted)",
+		"COPY 1 Archive",
+		"MOVE 1 Archive",
+		"EXPUNGE",
+		"CLOSE",
+		"CREATE foo",
+		"DELETE foo",
+		"RENAME foo bar",
+		"SUBSCRIBE foo",
+		"UNSUBSCRIBE foo",
+		"CHECK",
+		"SETACL INBOX alice lr",
+		"DELETEACL INBOX alice",
+		`SETQUOTA "" (STORAGE 10 20)`,
+		"SETMETADATA INBOX (/private/comment x)",
+		"UID STORE 1 +FLAGS (\\Deleted)",
+		"UID COPY 1 Archive",
+		"UID MOVE 1 Archive",
+		"UID EXPUNGE 1",
+		"UID 1",
+		"FROBNICATE",
+	}
+	for _, line := range commands {
+		t.Run(line, func(t *testing.T) {
+			client, upstream := startReadOnlyTestSession(t)
+			client.write(t, "A1 "+line+"\r\n")
+			if got := client.readLine(t); !strings.HasPrefix(got, "A1 NO ") {
+				t.Fatalf("client got %q, want a tagged NO", got)
+			}
+			client.expectClosed(t)
+			assertNotForwarded(t, upstream)
+		})
+	}
+}
+
+func TestSessionReadOnlyLoginIsRewrittenAndReadsWork(t *testing.T) {
+	client, upstream := startReadOnlyTestSession(t)
+	client.write(t, "A1 LOGIN \"shared\" \"client-password\"\r\n")
+	if got, want := upstream.readLine(t), "A1 LOGIN \"shared\" \"real-password\"\r\n"; got != want {
+		t.Fatalf("upstream got %q, want %q", got, want)
+	}
+	upstream.write(t, "A1 OK Logged in\r\n")
+	if got, want := client.readLine(t), "A1 OK Logged in\r\n"; got != want {
+		t.Fatalf("client got %q, want %q", got, want)
+	}
+
+	client.write(t, "A2 FETCH 1 BODY[TEXT]\r\n")
+	if got, want := upstream.readLine(t), "A2 FETCH 1 BODY[TEXT]\r\n"; got != want {
+		t.Fatalf("upstream got %q, want %q", got, want)
+	}
+	upstream.write(t, "* 1 FETCH (BODY[TEXT] {5}\r\n")
+	if got, want := client.readLine(t), "* 1 FETCH (BODY[TEXT] {5}\r\n"; got != want {
+		t.Fatalf("client got %q, want %q", got, want)
+	}
+	upstream.write(t, "hello")
+	if got, want := client.readN(t, 5), "hello"; got != want {
+		t.Fatalf("client literal = %q, want %q", got, want)
+	}
+	upstream.write(t, ")\r\n")
+	if got, want := client.readLine(t), ")\r\n"; got != want {
+		t.Fatalf("client got %q, want %q", got, want)
+	}
+}
+
+func TestSessionReadOnlyRewritesSelectAsExamine(t *testing.T) {
+	client, upstream := startReadOnlyTestSession(t)
+
+	client.write(t, "A1 SELECT INBOX\r\n")
+	if got, want := upstream.readLine(t), "A1 EXAMINE INBOX\r\n"; got != want {
+		t.Fatalf("upstream got %q, want %q", got, want)
+	}
+	upstream.write(t, "A1 OK [READ-ONLY] selected\r\n")
+	if got, want := client.readLine(t), "A1 OK [READ-ONLY] selected\r\n"; got != want {
+		t.Fatalf("client got %q, want %q", got, want)
+	}
+
+	// A literal mailbox name keeps its literal marker when rewritten.
+	client.write(t, "A2 SELECT {5}\r\n")
+	if got, want := upstream.readLine(t), "A2 EXAMINE {5}\r\n"; got != want {
+		t.Fatalf("upstream got %q, want %q", got, want)
+	}
+	if got, want := client.readLine(t), goAhead; got != want {
+		t.Fatalf("client got %q, want %q", got, want)
+	}
+	upstream.write(t, "+ go ahead\r\n")
+	client.write(t, "INBOX\r\n")
+	if got, want := upstream.readN(t, 5), "INBOX"; got != want {
+		t.Fatalf("upstream literal = %q, want %q", got, want)
+	}
+	if got, want := upstream.readLine(t), "\r\n"; got != want {
+		t.Fatalf("upstream command terminator = %q, want %q", got, want)
+	}
+	upstream.write(t, "A2 OK [READ-ONLY] selected\r\n")
+	if got, want := client.readLine(t), "A2 OK [READ-ONLY] selected\r\n"; got != want {
+		t.Fatalf("client got %q, want %q", got, want)
+	}
+}
+
+func TestSessionReadWriteDoesNotRewriteSelect(t *testing.T) {
+	client, upstream := startTestSession(t)
+	client.write(t, "A1 SELECT INBOX\r\n")
+	if got, want := upstream.readLine(t), "A1 SELECT INBOX\r\n"; got != want {
+		t.Fatalf("upstream got %q, want %q", got, want)
+	}
+	upstream.write(t, "A1 OK [READ-WRITE] selected\r\n")
+	if got, want := client.readLine(t), "A1 OK [READ-WRITE] selected\r\n"; got != want {
+		t.Fatalf("client got %q, want %q", got, want)
+	}
+}
+
+func TestSessionReadWriteStillForwardsMutatingCommands(t *testing.T) {
+	client, upstream := startTestSession(t)
+	client.write(t, "A1 STORE 1 +FLAGS (\\Deleted)\r\n")
+	if got, want := upstream.readLine(t), "A1 STORE 1 +FLAGS (\\Deleted)\r\n"; got != want {
+		t.Fatalf("upstream got %q, want %q", got, want)
+	}
+	upstream.write(t, "A1 OK stored\r\n")
+	if got, want := client.readLine(t), "A1 OK stored\r\n"; got != want {
+		t.Fatalf("client got %q, want %q", got, want)
 	}
 }
