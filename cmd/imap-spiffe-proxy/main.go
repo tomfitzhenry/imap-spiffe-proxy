@@ -35,10 +35,12 @@ func run() error {
 		upstream    = flag.String("upstream", "", "upstream IMAP server host:port (always reached over implicit TLS)")
 		upstreamSNI = flag.String("upstream-server-name", "", "upstream TLS server name (default: host part of -upstream)")
 		username    = flag.String("username", "", "the one shared upstream IMAP username")
-		allow       multiFlag
+		readWrite   multiFlag
+		readOnly    multiFlag
 		showVersion = flag.Bool("version", false, "print version and exit")
 	)
-	flag.Var(&allow, "allow", "exact client SPIFFE ID to allow (repeatable)")
+	flag.Var(&readWrite, "rw", "exact client SPIFFE ID allowed to issue any IMAP command (repeatable)")
+	flag.Var(&readOnly, "ro", "exact client SPIFFE ID restricted to non-mutating IMAP commands (repeatable)")
 	flag.Parse()
 
 	if *showVersion {
@@ -55,8 +57,8 @@ func run() error {
 	if *username == "" {
 		return errors.New("-username is required")
 	}
-	if len(allow) == 0 {
-		return errors.New("at least one -allow SPIFFE ID is required")
+	if len(readWrite) == 0 && len(readOnly) == 0 {
+		return errors.New("at least one -rw or -ro SPIFFE ID is required")
 	}
 
 	password, err := proxy.LoadPassword()
@@ -68,7 +70,8 @@ func run() error {
 		UpstreamAddress:       *upstream,
 		UpstreamTLSServerName: *upstreamSNI,
 		Username:              *username,
-		AllowedIdentities:     allow,
+		ReadWriteIdentities:   readWrite,
+		ReadOnlyIdentities:    readOnly,
 		Password:              password,
 	}
 	if err := cfg.Validate(); err != nil {
@@ -100,7 +103,8 @@ func run() error {
 		"upstream", cfg.UpstreamAddress,
 		"upstream_tls_server_name", cfg.UpstreamTLSServerName,
 		"imap_username", cfg.Username,
-		"allowed_identities", len(cfg.AllowedIdentities),
+		"read_write_identities", len(cfg.ReadWriteIdentities),
+		"read_only_identities", len(cfg.ReadOnlyIdentities),
 		"imap_password_source", "systemd LoadCredential",
 	)
 	if err := srv.Serve(ctx, ln); err != nil {
